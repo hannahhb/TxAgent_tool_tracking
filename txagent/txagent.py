@@ -160,7 +160,7 @@ class TxAgent:
                 return f"The model {model_name} is already loaded."
             self.model_name = model_name
 
-        self.model = LLM(model=self.model_name, device = self.device)
+        self.model = LLM(model=self.model_name)
         self.chat_template = Template(self.model.get_tokenizer().chat_template)
         self.tokenizer = self.model.get_tokenizer()
 
