@@ -69,6 +69,7 @@ class TxAgent:
                  umls_linker_kwargs: Optional[Dict[str, Any]] = None,
                  quickumls_path: Optional[str] = None,
                  umls_max_candidates: int = 3,
+                 device_id = None
                  ):
         self.model_name = model_name
         self.tokenizer = None
@@ -76,7 +77,21 @@ class TxAgent:
         self.rag_model_name = rag_model_name
         self.tool_files_dict = tool_files_dict
         self.model = None
-        self.rag_model = ToolRAGModel(rag_model_name)
+        
+        if device_id:
+            device_id_rag = device_id + 1
+            self.device = f"cuda:{device_id}"
+            device_rag = f"cuda:{device_id_rag}"
+        else: 
+            self.device = "cuda:0"
+            device_rag = "cuda:0"           
+
+
+        self.rag_model = ToolRAGModel(rag_model_name, device=device_rag)
+        
+        print(f"[INFO] Main model device: {self.device}")
+        print(f"[INFO] RAG model device: {self.rag_model.device}")
+
         self.tooluniverse = None
         # self.tool_desc = None
         self.prompt_multi_step = "You are a helpful assistant that will solve problems through detailed, step-by-step reasoning and actions based on your reasoning. Typically, your actions will use the provided functions. You have access to the following functions."
@@ -145,7 +160,7 @@ class TxAgent:
                 return f"The model {model_name} is already loaded."
             self.model_name = model_name
 
-        self.model = LLM(model=self.model_name)
+        self.model = LLM(model=self.model_name, device = self.device)
         self.chat_template = Template(self.model.get_tokenizer().chat_template)
         self.tokenizer = self.model.get_tokenizer()
 

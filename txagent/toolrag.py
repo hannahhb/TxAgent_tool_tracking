@@ -5,16 +5,17 @@ from .utils import get_md5
 
 
 class ToolRAGModel:
-    def __init__(self, rag_model_name):
+    def __init__(self, rag_model_name, device = "cuda:0"):
         self.rag_model_name = rag_model_name
         self.rag_model = None
         self.tool_desc_embedding = None
         self.tool_name = None
         self.tool_embedding_path = None
+        self.device = device 
         self.load_rag_model()
 
     def load_rag_model(self):
-        self.rag_model = SentenceTransformer(self.rag_model_name)
+        self.rag_model = SentenceTransformer(self.rag_model_name, device=self.device)
         self.rag_model.max_seq_length = 4096
         self.rag_model.tokenizer.padding_side = "right"
 

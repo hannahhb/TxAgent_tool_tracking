@@ -13,7 +13,8 @@ if __name__ == '__main__':
   
   agent = TxAgent(model_name,
                   rag_model_name,
-                  enable_summary=False)
+                  enable_summary=False,
+                  device_id = 0)
   agent.init_model()
   
   question = "Given a 50-year-old patient experiencing severe acute pain and considering the use of the newly approved medication, Journavx, how should the dosage be adjusted considering the presence of moderate hepatic impairment?"
