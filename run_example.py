@@ -2,7 +2,7 @@ if __name__ == '__main__':
   from txagent import TxAgent
   import os
   os.environ["MKL_THREADING_LAYER"] = "GNU"
-  os.environ["VLLM_USE_V1"] = 0
+  os.environ["VLLM_USE_V1"] = "0"
   
   model_name = 'mims-harvard/TxAgent-T1-Llama-3.1-8B'
   rag_model_name = 'mims-harvard/ToolRAG-T1-GTE-Qwen2-1.5B'
