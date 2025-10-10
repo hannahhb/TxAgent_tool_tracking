@@ -3,16 +3,46 @@ import os
 import sys
 import json
 import gc
+import math
+import re
+import logging
+import copy
+from collections import Counter
+from typing import List, Dict, Any, Optional
+
 import numpy as np
+import torch
 from vllm import LLM, SamplingParams
 from jinja2 import Template
-from typing import List
 import types
 from tooluniverse import ToolUniverse
 from gradio import ChatMessage
 from .toolrag import ToolRAGModel
 
 from .utils import NoRepeatSentenceProcessor, ReasoningTraceChecker, tool_result_format
+
+try:
+    import spacy  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    spacy = None
+
+try:
+    from spacy.lang.en.stop_words import STOP_WORDS  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    STOP_WORDS = None
+
+try:  # pragma: no cover - optional dependency
+    from scispacy.umls_linking import UmlsEntityLinker  # type: ignore
+except Exception:
+    UmlsEntityLinker = None
+
+try:  # pragma: no cover - optional dependency
+    from quickumls import QuickUMLS  # type: ignore
+except Exception:
+    QuickUMLS = None
+
+
+logger = logging.getLogger(__name__)
 
 
 class TxAgent:
@@ -33,6 +63,12 @@ class TxAgent:
                  enable_checker=False,
                  enable_chat=False,
                  additional_default_tools=None,
+                 enable_entity_awareness=False,
+                 entity_model_name=None,
+                 enable_umls_linking=False,
+                 umls_linker_kwargs: Optional[Dict[str, Any]] = None,
+                 quickumls_path: Optional[str] = None,
+                 umls_max_candidates: int = 3,
                  ):
         self.model_name = model_name
         self.tokenizer = None
@@ -59,6 +95,39 @@ class TxAgent:
         self.seed = seed
         self.enable_checker = enable_checker
         self.additional_default_tools = additional_default_tools
+        self.enable_entity_awareness = (enable_entity_awareness or enable_umls_linking) and spacy is not None
+        self.enable_umls_linking = enable_umls_linking and self.enable_entity_awareness
+        self.entity_model_name = entity_model_name
+        self._entity_nlp = None
+        self.umls_linker_kwargs = umls_linker_kwargs or {}
+        self.quickumls_path = quickumls_path
+        self.umls_max_candidates = max(1, umls_max_candidates)
+        self._umls_linker = None
+        self._quickumls = None
+        base_stopwords = {
+            "patient", "patients", "age", "male", "female", "year", "years",
+            "mg", "tablet", "tablets", "dose", "dosing", "treatment", "treatments",
+            "disease", "diseases", "condition", "conditions", "symptom", "symptoms",
+            "drug", "drugs", "option", "options", "information", "tool", "tools",
+            "result", "results", "plan", "plans", "data", "analysis", "analyses",
+            "approach", "approaches", "suitability"
+        }
+        if STOP_WORDS is not None:
+            base_stopwords |= {w.lower() for w in STOP_WORDS}
+        self.entity_stopwords = base_stopwords
+        default_labels = {
+            "CHEMICAL", "DRUG", "DISEASE", "SYMPTOM", "SIGN_OR_SYMPTOM",
+            "THERAPEUTIC_PROCEDURE", "DIAGNOSTIC_PROCEDURE", "PATHOLOGICAL_FUNCTION",
+            "ANATOMICAL_STRUCTURE", "INJURY_OR_POISONING", "LAB_VALUE", "GENE_OR_GENOME",
+        }
+        label_overrides = self.umls_linker_kwargs.pop("entity_labels", None)
+        if label_overrides:
+            default_labels = {lbl.upper() for lbl in label_overrides}
+        self.entity_label_whitelist = {lbl.upper() for lbl in default_labels}
+        self.last_entity_metadata: List[Dict[str, Any]] = []
+        self._tools_used_current: List[Dict[str, Any]] = []
+        self._tool_usage_stack: List[List[Dict[str, Any]]] = []
+        self.last_used_tools: List[Dict[str, Any]] = []
         self.print_self_values()
 
     def init_model(self):
@@ -94,6 +163,374 @@ class TxAgent:
 
     def rag_infer(self, query, top_k=5):
         return self.rag_model.rag_infer(query, top_k)
+
+    # -------------------- tool usage tracking --------------------
+    def _reset_tool_usage(self):
+        self._tool_usage_stack.append([])
+        self._tools_used_current = self._tool_usage_stack[-1]
+
+    def _record_tool_usage(self, name: str, stage: str, details: Optional[Dict[str, Any]] = None):
+        if not self._tool_usage_stack:
+            self._reset_tool_usage()
+        entry = {
+            "name": name,
+            "stage": stage,
+        }
+        if details:
+            entry["details"] = details
+        self._tool_usage_stack[-1].append(entry)
+        self._tools_used_current = self._tool_usage_stack[-1]
+
+    def _finalize_tool_log(self):
+        if not self._tool_usage_stack:
+            self.last_used_tools = []
+            self._tools_used_current = []
+            return
+        current = self._tool_usage_stack.pop()
+        if self._tool_usage_stack:
+            self._tools_used_current = self._tool_usage_stack[-1]
+            if current:
+                self._tool_usage_stack[-1].append({
+                    "name": "NestedSession",
+                    "stage": "child",
+                    "details": {"tools": copy.deepcopy(current)},
+                })
+        else:
+            self.last_used_tools = list(current)
+            self._tools_used_current = []
+
+    # -------------------- entity augmentation helpers --------------------
+    def _ensure_entity_pipeline(self):
+        if not self.enable_entity_awareness:
+            return None
+        if self._entity_nlp is not None:
+            return self._entity_nlp
+        model_name = self.entity_model_name or "en_core_sci_sm"
+        if spacy is None:
+            print("spaCy is unavailable; disabling entity awareness.")
+            self.enable_entity_awareness = False
+            return None
+        try:
+            self._entity_nlp = spacy.load(model_name)
+            print(f"Loaded spaCy entity model '{model_name}' for query augmentation.")
+        except Exception as exc:  # pragma: no cover - runtime path
+            print(f"Failed to load spaCy model '{model_name}': {exc}. Disabling entity awareness.")
+            self.enable_entity_awareness = False
+            self._entity_nlp = None
+            return None
+
+        if self.enable_umls_linking:
+            self._setup_umls_resources(self._entity_nlp)
+
+        return self._entity_nlp
+
+    def _setup_umls_resources(self, nlp) -> None:
+        if not self.enable_umls_linking:
+            return
+
+        if UmlsEntityLinker is None and (self.quickumls_path is None or QuickUMLS is None):
+            print("UMLS linking requested but dependencies are unavailable; disabling UMLS mode.")
+            self.enable_umls_linking = False
+            return
+
+        if UmlsEntityLinker is not None:
+            try:
+                linker_kwargs = dict(self.umls_linker_kwargs)
+                pipe_name = linker_kwargs.pop("pipe_name", "scispacy_umls_linker")
+                linker_kwargs.setdefault("resolve_abbreviations", True)
+                linker_kwargs.setdefault("threshold", 0.85)
+                linker_kwargs.setdefault("max_entities_per_mention", self.umls_max_candidates)
+                if pipe_name in nlp.pipe_names:
+                    linker = nlp.get_pipe(pipe_name)
+                else:
+                    linker = nlp.add_pipe("scispacy_linker", config=linker_kwargs, name=pipe_name)
+                self._umls_linker = linker
+                print(f"UMLS linker '{pipe_name}' initialised (SciSpaCy).")
+            except Exception as exc:
+                print(f"Failed to initialise SciSpaCy UMLS linker: {exc}")
+                self._umls_linker = None
+
+        if self.quickumls_path and QuickUMLS is not None and self._quickumls is None:
+            try:
+                self._quickumls = QuickUMLS(
+                    self.quickumls_path,
+                    threshold=self.umls_linker_kwargs.get("threshold", 0.85),
+                    window=self.umls_linker_kwargs.get("window", 5),
+                    min_match_length=self.umls_linker_kwargs.get("min_match_length", 3),
+                    best_match=True,
+                )
+                print("QuickUMLS matcher initialised for entity linking.")
+            except Exception as exc:
+                print(f"Failed to initialise QuickUMLS at '{self.quickumls_path}': {exc}")
+                self._quickumls = None
+
+    def _extract_entities(self, text: str, update_last: bool = True) -> List[Dict[str, Any]]:
+        if not text or not self.enable_entity_awareness:
+            if update_last:
+                self.last_entity_metadata = []
+            return []
+        nlp = self._ensure_entity_pipeline()
+        if nlp is None:
+            if update_last:
+                self.last_entity_metadata = []
+            return []
+        doc = nlp(text)
+        entities: List[Dict[str, Any]] = []
+        for ent in doc.ents:
+            label = getattr(ent, "label_", "").upper()
+            cleaned_tokens = [
+                tok for tok in ent.text.strip().split()
+                if tok.lower() not in self.entity_stopwords
+            ]
+            cleaned = " ".join(cleaned_tokens).strip()
+            if not cleaned:
+                continue
+            linking = self._link_entity(ent)
+            synonyms: List[str] = []
+            semantic_types: List[str] = []
+            for candidate in linking:
+                synonyms.extend(candidate.get("aliases", []) or [])
+                semantic_types.extend(candidate.get("types", []) or [])
+            synonyms = self._deduplicate_preserving_order([s for s in synonyms if s])
+            semantic_types = self._deduplicate_preserving_order([t for t in semantic_types if t])
+            if self.enable_umls_linking and not linking:
+                continue
+            if not linking:
+                if label and self.entity_label_whitelist and label not in self.entity_label_whitelist:
+                    continue
+                if cleaned.lower() in self.entity_stopwords:
+                    continue
+                if len(cleaned) <= 3:
+                    continue
+            primary = linking[0] if linking else {}
+            profile = {
+                "surface": cleaned,
+                "original": ent.text,
+                "start": ent.start_char,
+                "end": ent.end_char,
+                "primary_cui": primary.get("cui"),
+                "canonical_name": primary.get("canonical_name", cleaned),
+                "candidates": linking,
+                "synonyms": synonyms,
+                "semantic_types": semantic_types,
+            }
+            entities.append(profile)
+        if update_last:
+            self.last_entity_metadata = entities
+        return entities
+
+    def _augment_query_with_entities(self, text: str) -> str:
+        if not text:
+            return text
+        entities = self._extract_entities(text)
+        if not entities:
+            return text
+        unique_profiles: List[Dict[str, Any]] = []
+        seen = set()
+        for profile in entities:
+            key = profile.get("primary_cui") or profile.get("surface", "").lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_profiles.append(profile)
+        self.last_entity_metadata = unique_profiles
+        descriptions: List[str] = []
+        expansion_terms: List[str] = []
+        for profile in unique_profiles:
+            cui = profile.get("primary_cui")
+            types = profile.get("semantic_types", [])
+            synonyms = profile.get("synonyms", [])
+            canonical = profile.get("canonical_name") or profile.get("surface")
+            surface = profile.get("surface")
+            parts = [canonical]
+            if surface and surface.lower() != canonical.lower():
+                parts.append(f"mention={surface}")
+            if cui:
+                parts.append(f"CUI={cui}")
+            if types:
+                parts.append("types=" + ", ".join(types[:3]))
+            if synonyms:
+                parts.append("synonyms=" + ", ".join(synonyms[:3]))
+            descriptions.append("- " + "; ".join(parts))
+            expansion_terms.extend(synonyms[:3])
+            if cui:
+                expansion_terms.append(cui)
+            if canonical and canonical.lower() != (surface or "").lower():
+                expansion_terms.append(canonical)
+        expansion_terms = self._deduplicate_preserving_order([term for term in expansion_terms if term])
+        sections = [text]
+        if descriptions:
+            sections.append("Entity profiles:\n" + "\n".join(descriptions))
+        if expansion_terms:
+            sections.append("Related keywords: " + ", ".join(expansion_terms))
+        return "\n\n".join(sections)
+
+    def _link_entity(self, ent) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        # SciSpaCy linker results
+        if self._umls_linker is not None and hasattr(ent._, "umls_ents"):
+            for cui, score in list(getattr(ent._, "umls_ents", []))[: self.umls_max_candidates]:
+                entry = {
+                    "cui": cui,
+                    "score": float(score),
+                    "source": "scispacy",
+                    "aliases": [],
+                    "types": [],
+                    "canonical_name": None,
+                }
+                if cui in self._umls_linker.kb.cui_to_entity:
+                    kb_entry = self._umls_linker.kb.cui_to_entity[cui]
+                    entry["canonical_name"] = kb_entry.canonical_name
+                    entry["aliases"] = list(kb_entry.aliases[:20])
+                    entry["types"] = list(kb_entry.types)
+                candidates.append(entry)
+        # QuickUMLS fallback/augmentation
+        if self._quickumls is not None:
+            try:
+                matches = self._quickumls.match(ent.text, best_match=True)
+            except Exception as exc:
+                print(f"QuickUMLS linking failed: {exc}")
+                matches = []
+            for match in matches:
+                if not match:
+                    continue
+                best = match[0]
+                entry = {
+                    "cui": best.get("cui"),
+                    "score": float(best.get("similarity", 0.0)),
+                    "source": "quickumls",
+                    "canonical_name": best.get("term"),
+                    "aliases": list(best.get("aliases", [])) if isinstance(best.get("aliases"), list) else [],
+                    "types": list(best.get("semtypes", [])) if isinstance(best.get("semtypes"), (list, set, tuple)) else [],
+                }
+                candidates.append(entry)
+                if len(candidates) >= self.umls_max_candidates:
+                    break
+        unique: List[Dict[str, Any]] = []
+        seen = set()
+        for cand in candidates:
+            key = (cand.get("cui"), cand.get("source"))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(cand)
+            if len(unique) >= self.umls_max_candidates:
+                break
+        return unique
+
+    @staticmethod
+    def _deduplicate_preserving_order(items: List[Any]) -> List[Any]:
+        seen = set()
+        deduped = []
+        for item in items:
+            if item is None:
+                continue
+            key = item.lower() if isinstance(item, str) else item
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
+
+    # -------------------- uncertainty estimation --------------------
+    def sample_short_answers(self, question: str, k: int = 5,
+                             temperature: float = 0.7,
+                             max_new_tokens: int = 256,
+                             system_prompt: Optional[str] = None) -> List[Dict[str, str]]:
+        """Generate K concise answer samples with rationales for uncertainty analysis."""
+
+        if k <= 0:
+            return []
+        system_prompt = system_prompt or (
+            "You are a concise medical reasoning assistant. "
+            "Answer the question with a short rationale (1-2 sentences) and end with 'Final Answer: <choice or phrase>'."
+        )
+        base_conversation = []
+        base_conversation = self.set_system_prompt(base_conversation, system_prompt)
+        base_conversation.append({"role": "user", "content": question})
+
+        samples = []
+        for _ in range(k):
+            output = self.llm_infer(messages=base_conversation,
+                                    temperature=temperature,
+                                    tools=None,
+                                    max_new_tokens=max_new_tokens)
+            answer, rationale = self._parse_answer_output(output)
+            samples.append({
+                "answer": answer,
+                "rationale": rationale,
+                "raw": output.strip(),
+            })
+        return samples
+
+    def compute_semantic_entropy(self, samples: List[Dict[str, str]]) -> Dict[str, Any]:
+        """Return entropy and disagreement metrics over sampled answers."""
+
+        if not samples:
+            return {"entropy": 0.0, "pairwise_disagreement": 0.0,
+                    "answer_distribution": {}, "unique_answers": []}
+
+        answers = [s.get("answer", "").strip() or s.get("raw", "").strip()
+                   for s in samples]
+        normalized = [self._normalize_answer(a) for a in answers]
+
+        count = Counter(normalized)
+        total = sum(count.values())
+        probs = [c / total for c in count.values() if total > 0]
+        entropy = -sum(p * math.log(p + 1e-12, 2) for p in probs)
+
+        # pairwise disagreement
+        disagreements = 0
+        total_pairs = 0
+        for i in range(len(normalized)):
+            for j in range(i + 1, len(normalized)):
+                total_pairs += 1
+                if normalized[i] != normalized[j]:
+                    disagreements += 1
+        pairwise = (disagreements / total_pairs) if total_pairs else 0.0
+
+        distribution = {ans: cnt / total for ans, cnt in count.items()}
+        return {
+            "entropy": entropy,
+            "pairwise_disagreement": pairwise,
+            "answer_distribution": distribution,
+            "unique_answers": sorted(count.keys()),
+        }
+
+    def sample_and_score_uncertainty(self, question: str, k: int = 5,
+                                     temperature: float = 0.7,
+                                     max_new_tokens: int = 256,
+                                     system_prompt: Optional[str] = None) -> Dict[str, Any]:
+        """Convenience method returning samples plus entropy metrics."""
+        samples = self.sample_short_answers(question, k=k, temperature=temperature,
+                                            max_new_tokens=max_new_tokens,
+                                            system_prompt=system_prompt)
+        metrics = self.compute_semantic_entropy(samples)
+        return {
+            "samples": samples,
+            "metrics": metrics,
+        }
+
+    def _parse_answer_output(self, output: str) -> (str, str):
+        text = output.strip()
+        match = re.search(r"Final Answer\s*[:\-]?\s*(.+)$", text, re.IGNORECASE)
+        if match:
+            answer = match.group(1).strip()
+            rationale = text[:match.start()].strip()
+        else:
+            answer = text.split("\n")[-1].strip()
+            rationale = text
+        return answer, rationale
+
+    def _normalize_answer(self, answer: str) -> str:
+        if not answer:
+            return ""
+        trimmed = answer.strip()
+        mc_match = re.search(r"\b([A-E])\b", trimmed.upper())
+        if mc_match:
+            return mc_match.group(1)
+        trimmed = re.sub(r"[^a-z0-9]+", " ", trimmed.lower())
+        return trimmed.strip()
 
     def initialize_tools_prompt(self, call_agent, call_agent_level, message):
         picked_tools_prompt = []
@@ -143,8 +580,18 @@ class TxAgent:
         extra_factor = 30  # Factor to retrieve more than rag_num
         if picked_tool_names is None:
             assert picked_tool_names is not None or message is not None
+            augmented_message = self._augment_query_with_entities(message)
             picked_tool_names = self.rag_infer(
-                message, top_k=rag_num*extra_factor)
+                augmented_message, top_k=rag_num*extra_factor)
+            self._record_tool_usage(
+                "Tool_RAG",
+                "retrieval",
+                {
+                    "query": augmented_message,
+                    "top_k": rag_num * extra_factor,
+                    "entity_metadata": copy.deepcopy(self.last_entity_metadata),
+                },
+            )
 
         picked_tool_names_no_special = []
         for tool in picked_tool_names:
@@ -156,6 +603,12 @@ class TxAgent:
         picked_tools = self.tooluniverse.get_tool_by_name(picked_tool_names)
         picked_tools_prompt = self.tooluniverse.prepare_tool_prompts(
             picked_tools)
+        if picked_tool_names:
+            self._record_tool_usage(
+                "Tool_RAG",
+                "selection",
+                {"picked_tools": list(picked_tool_names)},
+            )
         if return_call_result:
             return picked_tools_prompt, picked_tool_names
         return picked_tools_prompt
@@ -246,6 +699,14 @@ class TxAgent:
 
                     call_id = self.tooluniverse.call_id_gen()
                     function_call_json[i]["call_id"] = call_id
+                    self._record_tool_usage(
+                        function_call_json[i]["name"],
+                        "execution",
+                        {
+                            "arguments": function_call_json[i].get("arguments", {}),
+                            "result_preview": str(call_result)[:500],
+                        },
+                    )
                     print("\033[94mTool Call Result:\033[0m", call_result)
                     call_results.append({
                         "role": "tool",
@@ -328,6 +789,14 @@ class TxAgent:
 
                     call_id = self.tooluniverse.call_id_gen()
                     function_call_json[i]["call_id"] = call_id
+                    self._record_tool_usage(
+                        function_call_json[i]["name"],
+                        "execution",
+                        {
+                            "arguments": function_call_json[i].get("arguments", {}),
+                            "result_preview": str(call_result)[:500],
+                        },
+                    )
                     call_results.append({
                         "role": "tool",
                         "content": json.dumps({"content": call_result, "call_id": call_id})
@@ -392,6 +861,12 @@ class TxAgent:
             str: The generated response.
         """
         print("\033[1;32;40mstart\033[0m")
+        self._reset_tool_usage()
+
+        def _final_return(val):
+            self._finalize_tool_log()
+            return val
+
         picked_tools_prompt, call_agent_level = self.initialize_tools_prompt(
             call_agent, call_agent_level, message)
         conversation = self.initialize_conversation(message)
@@ -425,7 +900,7 @@ class TxAgent:
                         if isinstance(function_call_messages[0]['content'], types.GeneratorType):
                             function_call_messages[0]['content'] = next(
                                 function_call_messages[0]['content'])
-                        return function_call_messages[0]['content'].split('[FinalAnswer]')[-1]
+                        return _final_return(function_call_messages[0]['content'].split('[FinalAnswer]')[-1])
 
                     if (self.enable_summary or token_overflow) and not call_agent:
                         if token_overflow:
@@ -442,7 +917,7 @@ class TxAgent:
                         next_round = False
                         conversation.extend(
                             [{"role": "assistant", "content": ''.join(last_outputs)}])
-                        return ''.join(last_outputs).replace("</s>", "")
+                        return _final_return(''.join(last_outputs).replace("</s>", ""))
                 if self.enable_checker:
                     good_status, wrong_info = checker.check_conversation()
                     if not good_status:
@@ -467,16 +942,16 @@ class TxAgent:
             if max_round == current_round:
                 print("The number of rounds exceeds the maximum limit!")
             if self.force_finish:
-                return self.get_answer_based_on_unfinished_reasoning(conversation, temperature, max_new_tokens, max_token)
+                return _final_return(self.get_answer_based_on_unfinished_reasoning(conversation, temperature, max_new_tokens, max_token))
             else:
-                return None
+                return _final_return(None)
 
         except Exception as e:
             print(f"Error: {e}")
             if self.force_finish:
-                return self.get_answer_based_on_unfinished_reasoning(conversation, temperature, max_new_tokens, max_token)
+                return _final_return(self.get_answer_based_on_unfinished_reasoning(conversation, temperature, max_new_tokens, max_token))
             else:
-                return None
+                return _final_return(None)
 
     def build_logits_processor(self, messages, llm):
         # Use the tokenizer from the LLM instance.
