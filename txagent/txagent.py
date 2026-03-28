@@ -12,13 +12,20 @@ from typing import List, Dict, Any, Optional
 
 import numpy as np
 import torch
-from vllm import LLM, SamplingParams
 from jinja2 import Template
+
+try:
+    from vllm import LLM, SamplingParams
+    _VLLM_AVAILABLE = True
+except ImportError:
+    LLM = None          # type: ignore[assignment]
+    SamplingParams = None  # type: ignore[assignment]
+    _VLLM_AVAILABLE = False
 import types
 from tooluniverse import ToolUniverse
 from gradio import ChatMessage
-from .toolrag import ToolRAGModel
-
+from .bedrock_client import BedrockLLM
+from .toolrag import ToolRAGModel, ToolRAGModelBedrock
 from .utils import NoRepeatSentenceProcessor, ReasoningTraceChecker, tool_result_format
 
 try:
@@ -69,7 +76,12 @@ class TxAgent:
                  umls_linker_kwargs: Optional[Dict[str, Any]] = None,
                  quickumls_path: Optional[str] = None,
                  umls_max_candidates: int = 3,
-                 device_id = None
+                 device_id = None,
+                 use_bedrock: bool = False,
+                 bedrock_model_id: Optional[str] = None,
+                 bedrock_region: Optional[str] = None,
+                 bedrock_client_kwargs: Optional[Dict[str, Any]] = None,
+                 bedrock_rag_model_id: Optional[str] = None,
                  ):
         self.model_name = model_name
         self.tokenizer = None
@@ -77,8 +89,22 @@ class TxAgent:
         self.rag_model_name = rag_model_name
         self.tool_files_dict = tool_files_dict
         self.model = None
-        
-        if device_id:
+        self.chat_template: Optional[Template] = None
+        env_flag = os.environ.get("TXAGENT_USE_BEDROCK", "").strip().lower()
+        self.use_bedrock = use_bedrock or env_flag in {"1", "true", "yes"}
+        self.bedrock_model_id = bedrock_model_id or os.environ.get(
+            "TXAGENT_BEDROCK_MODEL_ID", model_name)
+        self.bedrock_region = bedrock_region or os.environ.get("TXAGENT_BEDROCK_REGION")
+        self._bedrock_llm: Optional[BedrockLLM] = None
+        self._bedrock_client_kwargs = bedrock_client_kwargs or {}
+        self.bedrock_rag_model_id = bedrock_rag_model_id or os.environ.get("TXAGENT_BEDROCK_RAG_MODEL_ID")
+        if self.bedrock_rag_model_id is None:
+            if self.bedrock_model_id:
+                self.bedrock_rag_model_id = self.bedrock_model_id
+            else:
+                self.bedrock_rag_model_id = rag_model_name
+
+        if device_id is not None:
             device_id_rag = device_id + 1
             self.device = f"cuda:{device_id}"
             device_rag = f"cuda:{device_id_rag}"
@@ -86,11 +112,20 @@ class TxAgent:
             self.device = "cuda:0"
             device_rag = "cuda:0"           
 
-
-        self.rag_model = ToolRAGModel(rag_model_name, device=device_rag)
-        
         print(f"[INFO] Main model device: {self.device}")
-        print(f"[INFO] RAG model device: {self.rag_model.device}")
+        print(f"[INFO] RAG model device: {device_rag}")
+        
+        if self.use_bedrock:
+            self.rag_model = ToolRAGModelBedrock(
+                self.bedrock_rag_model_id or rag_model_name,
+                device=device_rag,
+                bedrock_region=self.bedrock_region,
+                client_kwargs=self._bedrock_client_kwargs,
+            )
+        else:
+            self.rag_model = ToolRAGModel(rag_model_name, device=device_rag)
+        
+        
 
         self.tooluniverse = None
         # self.tool_desc = None
@@ -119,17 +154,12 @@ class TxAgent:
         self.umls_max_candidates = max(1, umls_max_candidates)
         self._umls_linker = None
         self._quickumls = None
-        base_stopwords = {
-            "patient", "patients", "age", "male", "female", "year", "years",
-            "mg", "tablet", "tablets", "dose", "dosing", "treatment", "treatments",
-            "disease", "diseases", "condition", "conditions", "symptom", "symptoms",
-            "drug", "drugs", "option", "options", "information", "tool", "tools",
-            "result", "results", "plan", "plans", "data", "analysis", "analyses",
-            "approach", "approaches", "suitability"
-        }
-        if STOP_WORDS is not None:
-            base_stopwords |= {w.lower() for w in STOP_WORDS}
-        self.entity_stopwords = base_stopwords
+        # base_stopwords = {
+           
+        # }
+        # if STOP_WORDS is not None:
+        #     base_stopwords |= {w.lower() for w in STOP_WORDS}
+        # self.entity_stopwords = base_stopwords
         default_labels = {
             "CHEMICAL", "DRUG", "DISEASE", "SYMPTOM", "SIGN_OR_SYMPTOM",
             "THERAPEUTIC_PROCEDURE", "DIAGNOSTIC_PROCEDURE", "PATHOLOGICAL_FUNCTION",
@@ -160,6 +190,25 @@ class TxAgent:
                 return f"The model {model_name} is already loaded."
             self.model_name = model_name
 
+        if self.use_bedrock:
+            target_model = self.bedrock_model_id or self.model_name
+            self._bedrock_llm = BedrockLLM(
+                model_id=target_model,
+                region=self.bedrock_region,
+                client_kwargs=self._bedrock_client_kwargs,
+            )
+            self.chat_template = None
+            self.tokenizer = None
+            self.model = None
+            return f"Bedrock model {target_model} initialised successfully."
+
+        if not _VLLM_AVAILABLE:
+            raise ImportError(
+                "vllm is required for the HuggingFace/local backend. "
+                "Install it with: pip install vllm  "
+                "Or use the Bedrock backend by passing use_bedrock=True."
+            )
+
         self.model = LLM(model=self.model_name)
         self.chat_template = Template(self.model.get_tokenizer().chat_template)
         self.tokenizer = self.model.get_tokenizer()
@@ -174,9 +223,13 @@ class TxAgent:
         self.special_tools_name = [tool['name'] for tool in special_tools]
 
     def load_tool_desc_embedding(self):
+        if self.rag_model is None:
+            return
         self.rag_model.load_tool_desc_embedding(self.tooluniverse)
 
     def rag_infer(self, query, top_k=5):
+        if self.rag_model is None:
+            return []
         return self.rag_model.rag_infer(query, top_k)
 
     # -------------------- tool usage tracking --------------------
@@ -448,84 +501,37 @@ class TxAgent:
         return deduped
 
     # -------------------- uncertainty estimation --------------------
-    def sample_short_answers(self, question: str, k: int = 5,
-                             temperature: float = 0.7,
-                             max_new_tokens: int = 256,
-                             system_prompt: Optional[str] = None) -> List[Dict[str, str]]:
-        """Generate K concise answer samples with rationales for uncertainty analysis."""
+    # def sample_short_answers(self, question: str, k: int = 5,
+    #                          temperature: float = 0.7,
+    #                          max_new_tokens: int = 256,
+    #                          system_prompt: Optional[str] = None) -> List[Dict[str, str]]:
+    #     """Generate K concise answer samples with rationales for uncertainty analysis."""
 
-        if k <= 0:
-            return []
-        system_prompt = system_prompt or (
-            "You are a concise medical reasoning assistant. "
-            "Answer the question with a short rationale (1-2 sentences) and end with 'Final Answer: <choice or phrase>'."
-        )
-        base_conversation = []
-        base_conversation = self.set_system_prompt(base_conversation, system_prompt)
-        base_conversation.append({"role": "user", "content": question})
+    #     if k <= 0:
+    #         return []
+    #     system_prompt = system_prompt or (
+    #         "You are a concise medical reasoning assistant. "
+    #         "Answer the question with a short rationale (1-2 sentences) and end with 'Final Answer: <choice or phrase>'."
+    #     )
+    #     base_conversation = []
+    #     base_conversation = self.set_system_prompt(base_conversation, system_prompt)
+    #     base_conversation.append({"role": "user", "content": question})
 
-        samples = []
-        for _ in range(k):
-            output = self.llm_infer(messages=base_conversation,
-                                    temperature=temperature,
-                                    tools=None,
-                                    max_new_tokens=max_new_tokens)
-            answer, rationale = self._parse_answer_output(output)
-            samples.append({
-                "answer": answer,
-                "rationale": rationale,
-                "raw": output.strip(),
-            })
-        return samples
+    #     samples = []
+    #     for _ in range(k):
+    #         output = self.llm_infer(messages=base_conversation,
+    #                                 temperature=temperature,
+    #                                 tools=None,
+    #                                 max_new_tokens=max_new_tokens)
+    #         answer, rationale = self._parse_answer_output(output)
+    #         samples.append({
+    #             "answer": answer,
+    #             "rationale": rationale,
+    #             "raw": output.strip(),
+    #         })
+    #     return samples
 
-    def compute_semantic_entropy(self, samples: List[Dict[str, str]]) -> Dict[str, Any]:
-        """Return entropy and disagreement metrics over sampled answers."""
-
-        if not samples:
-            return {"entropy": 0.0, "pairwise_disagreement": 0.0,
-                    "answer_distribution": {}, "unique_answers": []}
-
-        answers = [s.get("answer", "").strip() or s.get("raw", "").strip()
-                   for s in samples]
-        normalized = [self._normalize_answer(a) for a in answers]
-
-        count = Counter(normalized)
-        total = sum(count.values())
-        probs = [c / total for c in count.values() if total > 0]
-        entropy = -sum(p * math.log(p + 1e-12, 2) for p in probs)
-
-        # pairwise disagreement
-        disagreements = 0
-        total_pairs = 0
-        for i in range(len(normalized)):
-            for j in range(i + 1, len(normalized)):
-                total_pairs += 1
-                if normalized[i] != normalized[j]:
-                    disagreements += 1
-        pairwise = (disagreements / total_pairs) if total_pairs else 0.0
-
-        distribution = {ans: cnt / total for ans, cnt in count.items()}
-        return {
-            "entropy": entropy,
-            "pairwise_disagreement": pairwise,
-            "answer_distribution": distribution,
-            "unique_answers": sorted(count.keys()),
-        }
-
-    def sample_and_score_uncertainty(self, question: str, k: int = 5,
-                                     temperature: float = 0.7,
-                                     max_new_tokens: int = 256,
-                                     system_prompt: Optional[str] = None) -> Dict[str, Any]:
-        """Convenience method returning samples plus entropy metrics."""
-        samples = self.sample_short_answers(question, k=k, temperature=temperature,
-                                            max_new_tokens=max_new_tokens,
-                                            system_prompt=system_prompt)
-        metrics = self.compute_semantic_entropy(samples)
-        return {
-            "samples": samples,
-            "metrics": metrics,
-        }
-
+   
     def _parse_answer_output(self, output: str) -> (str, str):
         text = output.strip()
         match = re.search(r"Final Answer\s*[:\-]?\s*(.+)$", text, re.IGNORECASE)
@@ -989,6 +995,23 @@ class TxAgent:
                   max_token=None, skip_special_tokens=True,
                   model=None, tokenizer=None, terminators=None, seed=None, check_token_status=False):
 
+        if self.use_bedrock:
+            if self._bedrock_llm is None:
+                self.load_models()
+            prompt = self._render_prompt(messages, tools)
+            if output_begin_string is not None:
+                prompt += output_begin_string
+            output = self._bedrock_llm.chat(
+                prompt,
+                temperature=temperature,
+                max_tokens=max_new_tokens,
+            )
+            print("\033[92m" + output + "\033[0m")
+            if check_token_status and max_token is not None:
+                token_overflow = False
+                return output, token_overflow
+            return output
+
         if model is None:
             model = self.model
 
@@ -1000,12 +1023,11 @@ class TxAgent:
             seed=seed if seed is not None else self.seed,
         )
 
-        prompt = self.chat_template.render(
-            messages=messages, tools=tools, add_generation_prompt=True)
+        prompt = self._render_prompt(messages, tools)
         if output_begin_string is not None:
             prompt += output_begin_string
 
-        if check_token_status and max_token is not None:
+        if check_token_status and max_token is not None and self.tokenizer is not None:
             token_overflow = False
             num_input_tokens = len(self.tokenizer.encode(
                 prompt, return_tensors="pt")[0])
@@ -1029,6 +1051,46 @@ class TxAgent:
             return output, token_overflow
 
         return output
+
+    def _render_prompt(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]]):
+        """
+        Render the conversation to a prompt string. Falls back to a simple textual
+        template when an LLM chat template is unavailable (e.g., Bedrock mode).
+        """
+        if self.chat_template is not None:
+            return self.chat_template.render(
+                messages=messages, tools=tools, add_generation_prompt=True)
+
+        sections: List[str] = []
+        for message in messages:
+            role = message.get("role", "user")
+            content = message.get("content", "")
+            if isinstance(content, list):
+                normalized_chunks = []
+                for chunk in content:
+                    if isinstance(chunk, str):
+                        normalized_chunks.append(chunk)
+                    else:
+                        normalized_chunks.append(json.dumps(chunk, ensure_ascii=False))
+                content = "\n".join(normalized_chunks)
+            if isinstance(content, types.GeneratorType):
+                content = next(content)
+            if not isinstance(content, str):
+                content = str(content)
+            entry = f"{role.upper()}:\n{content.strip()}"
+            if message.get("tool_calls"):
+                entry += f"\n[TOOL_CALLS]\n{message['tool_calls']}"
+            sections.append(entry.strip())
+
+        if tools:
+            sections.append("AVAILABLE TOOLS:")
+            try:
+                sections.append(json.dumps(tools, ensure_ascii=False))
+            except TypeError:
+                sections.append(str(tools))
+
+        sections.append("ASSISTANT:")
+        return "\n\n".join(sections)
 
     def run_self_agent(self, message: str,
                        temperature: float,

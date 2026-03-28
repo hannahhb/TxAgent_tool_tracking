@@ -17,12 +17,30 @@ def get_md5(input_str):
 
 
 def tool_result_format(function_call_messages):
-    current_output = "\n\n<details>\n<summary> <strong>Verfied Feedback from Tools</strong>, click to see details:</summary>\n\n"
+    current_output = "\n\n<details>\n<summary> <strong>Verified Feedback from Tools</strong>, click to see details:</summary>\n\n"
+    seen_normalized = set()
     for each_message in function_call_messages:
-        if each_message['role'] == 'tool':
-            current_output += f"{each_message['content']}\n\n"
+        if each_message['role'] != 'tool':
+            continue
+        content_text = each_message.get('content', "")
+        normalized = _normalize_tool_text(content_text)
+        if normalized in seen_normalized:
+            continue
+        seen_normalized.add(normalized)
+        current_output += f"{content_text}\n\n"
     current_output += "</details>\n\n\n"
     return current_output
+
+
+def _normalize_tool_text(text: str) -> str:
+    try:
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            text = payload.get("content", text)
+    except Exception:
+        pass
+    normalized = " ".join(str(text).split())
+    return normalized
 
 
 class NoRepeatSentenceProcessor:
