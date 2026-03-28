@@ -1001,14 +1001,19 @@ class TxAgent:
         if self.use_bedrock:
             if self._bedrock_llm is None:
                 self.load_models()
-            prompt = self._render_prompt(messages, tools)
-            if output_begin_string is not None:
-                prompt += output_begin_string
-            output = self._bedrock_llm.chat(
-                prompt,
+            # Extract system prompt from messages (first message if role==system)
+            system_prompt = None
+            if messages and messages[0].get("role") == "system":
+                system_prompt = messages[0].get("content", "")
+            output = self._bedrock_llm.chat_with_tools(
+                messages=messages,
+                tools=tools,
+                system_prompt=system_prompt,
                 temperature=temperature,
                 max_tokens=max_new_tokens,
             )
+            if output_begin_string is not None:
+                output += output_begin_string
             print("\033[92m" + output + "\033[0m")
             if check_token_status and max_token is not None:
                 token_overflow = False
