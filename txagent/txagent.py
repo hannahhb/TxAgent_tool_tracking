@@ -104,13 +104,16 @@ class TxAgent:
             else:
                 self.bedrock_rag_model_id = rag_model_name
 
-        if device_id is not None:
-            device_id_rag = device_id + 1
-            self.device = f"cuda:{device_id}"
-            device_rag = f"cuda:{device_id_rag}"
-        else: 
-            self.device = "cuda:0"
-            device_rag = "cuda:0"           
+        if self.use_bedrock:
+            # No local model loaded — device assignments are irrelevant for the main LLM.
+            # RAG model (if HF-based) gets device_id if provided, else CPU.
+            self.device = "cpu"
+            device_rag = f"cuda:{device_id}" if device_id is not None else "cpu"
+        else:
+            # Both main model and RAG model need GPU.
+            # Default to cuda:0; if device_id is explicit, RAG goes on the same device.
+            self.device = f"cuda:{device_id}" if device_id is not None else "cuda:0"
+            device_rag = self.device
 
         print(f"[INFO] Main model device: {self.device}")
         print(f"[INFO] RAG model device: {device_rag}")
