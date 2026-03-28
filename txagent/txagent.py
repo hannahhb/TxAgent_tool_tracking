@@ -1091,6 +1091,19 @@ class TxAgent:
                 sections.append(json.dumps(tools, ensure_ascii=False))
             except TypeError:
                 sections.append(str(tools))
+            sections.append(
+                "TOOL CALL INSTRUCTIONS:\n"
+                "- Call exactly ONE tool per response.\n"
+                "- Do NOT use your built-in function-calling syntax.\n"
+                "- To call a tool, write your reasoning first, then on a new line output the "
+                "marker [TOOL_CALLS] followed immediately by a JSON array on the next line.\n"
+                "- Format:\n"
+                "  [TOOL_CALLS]\n"
+                '  [{"name": "tool_name", "arguments": {"param": "value"}}]\n'
+                "- If you are ready to give a final answer, call the Finish tool:\n"
+                "  [TOOL_CALLS]\n"
+                '  [{"name": "Finish", "arguments": {"answer": "[FinalAnswer] your answer here"}}]'
+            )
 
         sections.append("ASSISTANT:")
         return "\n\n".join(sections)
